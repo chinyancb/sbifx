@@ -24,10 +24,11 @@ import asyncio
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 import chromedriver_binary
+from selenium.webdriver.support.select import Select
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException
+
+from bs4 import BeautifulSoup
 from mylib.lineutil import LineUtil
 
 #------------------------------
@@ -37,7 +38,10 @@ app_home = str(Path(__file__).parents[1])
 sys.path.append(app_home)
 
 # SBI証券サイトURL
-SBI_URL = 'https://www.sbisec.co.jp'
+SBI_URL = 'https://site2.sbisec.co.jp/ETGate/?_ControlID=WPLEThmR001Control&_PageID=DefaultPID&_DataStoreID=DSWPLEThmR001Control&_ActionID=DefaultAID&getFlg=on'
+
+# SBI証券FXページURL
+FX_PAGE_URL = 'https://fx.sbisec.co.jp/forex/trade/client/index.aspx'
 
 # ログイン情報
 userid    = os.environ['SBI_U']
@@ -521,14 +525,16 @@ class FxTradeUtil(object):
         """
 
         self.log.info(f'called login_sbi().')
-        
         options = webdriver.ChromeOptions()
+#        p_id = '1'
+#        options.add_argument(f'user-data-dir={app_home}/Chrome') 
+#        options.add_argument('--profile-directory=Profile '+ p_id)
         if headless == True:
             options.add_argument('--headless')
         driver = webdriver.Chrome(options=options)
         
         try:
-            driver.get('https://www.sbisec.co.jp')
+            driver.get(SBI_URL)
             driver.find_element_by_xpath("//input[@name='user_id']").send_keys(userid)
             driver.find_element_by_xpath("//input[@name='user_password']").send_keys(password)
             driver.find_element_by_xpath("//input[@title='ログイン']").click()
@@ -575,6 +581,10 @@ class FxTradeUtil(object):
 
 
 
+
+
+
+
     def set_up_order_screen(self, driver):
         """
         * 成行で新規注文を出せる状態にする
@@ -588,7 +598,7 @@ class FxTradeUtil(object):
             array-like
             * 成功時
                 True:bool
-                driver:webdriver (ディーリングボードを表示した場外のdriver)
+                driver:webdriver (ディーリングボードを表示した状態のdriver)
             * 失敗時
                 False:bool
                 driver:webdriver (引数に渡された状態のdriver)
@@ -622,6 +632,408 @@ class FxTradeUtil(object):
         self.log.info('set_up_order_screen() done.')
         return [True, driver]
 
+    
+
+
+    def get_rate(self, driver, position):
+        """
+        * レートを取得する
+        * param
+            driver:webdriver (ディーリングボードフレームに設定された状態)
+            position:str 'ASK' or 'BIT'
+        * return
+            rate:float 関数を呼び出した時点のレート
+            * 成功
+                実際のレート
+            * 失敗
+                -1
+        """
+
+        if position !='ASK' and position !='BIT':
+            return -1
+
+        html = driver.page_source
+        soup = BeautifulSoup(html, 'lxml')
+
+        try:
+            if position == 'ASK':
+                return float(soup.select('#ask-rate-USDJPY')[0].text)
+            else:
+                return float(soup.select('#bid-rate-USDJPY')[0].text)
+        except Exception as e:
+            self.log.error(f'get rate error. :[{e}]')
+            return -1
+
+
+    def order_ask_makert(self, driver):
+        """
+        * ディーリングボードで成行でロング注文を出す
+          約定時の価格を取得する
+          !引数でロング・ショートの判別をしてもいいが、少しでも早く注文したいので関数で分けることにした
+        * param
+            driver:set_up_order_screen()でディーリングボードのセットアップ完了状態時のdriver
+        * return
+            array-like
+            * 成功時
+                True:bool
+                driver:webdriver(ディーリングボードのiframeにスイッチした状態のdriver)
+                contract_price:float 約定価格
+        
+            * 失敗時
+                False:bool
+                driver:webdriver(引数に渡された状態のdriver)
+                contract_price:float 0.0
+        """
+        self.log.info('order_ask_makert() called.')
+        tmp_driver = driver
+
+        try:
+            # 成行き注文
+            driver.find_element_by_xpath("//button[@id='btn_ask_USDJPY']").click()
+           
+            # frameをFXトップページに戻し約定した価格を取得
+            driver.switch_to.default_content()
+
+            # 約定価格を確認するためframe_topにスイッチ
+            frame_top = driver.find_element_by_css_selector('#frame_top')
+            driver.switch_to.frame(frame_top)
+
+            # 「照会」をクリックし建玉サマリにフレームをスイッチ
+            driver.find_element_by_css_selector('#watch').click()
+            driver.switch_to.default_content()
+            frame_trade = driver.find_element_by_css_selector('#frame_trade')
+            driver.switch_to.frame(frame_trade)
+
+            # 約定価格を取得
+            tategyoku_info_list = driver.find_element_by_css_selector('.tline-normal').text.split(' ')
+            contract_price =  float(tategyoku_info_list[3])
+
+            # ディーリングボードのフレームにスイッチ
+            driver.switch_to.default_content()
+            frame_price = driver.find_element_by_css_selector('#frame_price')
+            driver.switch_to.frame(frame_price)
+        except Exception as e:
+            self.log.error(f'ask order error. :[{e}]')
+            return [False, tmp_driver, float(0.0)]
+
+        self.log.info('order_ask_makert() done.')
+        return [True, driver, contract_price]
+
+
+    def order_bid_makert(self, driver):
+        """
+        * ディーリングボードで成行でロング注文を出す
+          約定時の価格を取得する
+          !引数でロング・ショートの判別をしてもいいが、少しでも早く注文したいので関数で分けることにした
+        * param
+            driver:set_up_order_screen()でディーリングボードのセットアップ完了状態時のdriver
+        * return
+            array-like
+            * 成功時
+                True:bool
+                driver:webdriver(ディーリングボードのiframeにスイッチした状態のdriver)
+                contract_price:float 約定価格
+        
+            * 失敗時
+                False:bool
+                driver:webdriver(引数に渡された状態のdriver)
+                contract_price:float 0.0
+        """
+        self.log.info('order_bid_makert() called.')
+        tmp_driver = driver
+
+        try:
+            # 成行き注文
+            driver.find_element_by_xpath("//button[@id='btn_bid_USDJPY']").click()
+           
+            # frameをFXトップページに戻し約定した価格を取得
+            driver.switch_to.default_content()
+
+            # 約定価格を確認するためframe_topにスイッチ
+            frame_top = driver.find_element_by_css_selector('#frame_top')
+            driver.switch_to.frame(frame_top)
+
+            # 「照会」をクリックし建玉サマリにフレームをスイッチ
+            driver.find_element_by_css_selector('#watch').click()
+            driver.switch_to.default_content()
+            frame_trade = driver.find_element_by_css_selector('#frame_trade')
+            driver.switch_to.frame(frame_trade)
+
+            # 約定価格を取得
+            tategyoku_info_list = driver.find_element_by_css_selector('.tline-normal').text.split(' ')
+            contract_price =  float(tategyoku_info_list[3])
+
+            # ディーリングボードのフレームにスイッチ
+            driver.switch_to.default_content()
+            frame_price = driver.find_element_by_css_selector('#frame_price')
+            driver.switch_to.frame(frame_price)
+        except Exception as e:
+            self.log.error(f'bid order error. :[{e}]')
+            return [False, tmp_driver, float(0.0)]
+
+        self.log.info('order_bid_makert() done.')
+        return [True, driver, contract_price]
+
+    
+
+    def order_stop_loss(self, driver, stop_price, stop_pips): 
+        """
+        * 逆指値でストップロスを注文する
+          主にエントリー直後に使用する
+        * param
+            driver:webdriver('ディーリングボードのフレームに設定した状態')
+            stop_price:str 逆指値(円)
+            stop_pips:str  逆指値(pips)
+        * return
+            array-like
+            * 成功時
+                True:bool
+                driver:webdriver('ディーリングボードのフレームに設定した状態')
+            * 失敗時
+                False:bool
+                driver:引数に渡された状態
+        """
+        
+        self.log.info('order_stop_loss() called.')
+        tmp_driver = driver
+
+        try:
+            # 照会をクリック
+            driver.switch_to.default_content()
+            frame_top = driver.find_element_by_css_selector('#frame_top')
+            driver.switch_to.frame(frame_top)
+            driver.find_element_by_css_selector('#watch').click()
+            self.log.info(f'syoukai link click done.')
+
+
+            # 決済画面に遷移
+            driver.switch_to.default_content()
+            frame_trade = driver.find_element_by_css_selector('#frame_trade')
+            driver.switch_to.frame(frame_trade)
+            url = driver.find_element_by_xpath("//*[@id='Label1']/table[2]/tbody/tr[3]/td[9]/a").get_attribute('href')
+            driver.get(url)
+            self.log.info('payment page transition done.')
+
+    
+            # ストップロスを入力し発注
+            #! デフォルトで価格がグレーアウトしているため一旦OCOに変えた後、逆指値に設定する
+            order_type_elem = driver.find_element_by_xpath("//select[@name='order']")
+            order_type_drop = Select(order_type_elem)
+            order_type_drop.select_by_visible_text('OCO')
+            self.log.info('COC clicked. (temporary)')
+
+            # 逆指値に設定(逆指値はサイト上「通常」扱い)
+            order_type_elem = driver.find_element_by_xpath("//select[@name='order']")
+            order_type_drop = Select(order_type_elem)
+            order_type_drop.select_by_visible_text('通常')
+            driver.find_element_by_xpath("//input[@name='sikkoujyouken' and @value='2']").click()
+            self.log.info('stop price clicked.')
+            driver.find_element_by_css_selector('#sasine1_1').send_keys(stop_price)
+            driver.find_element_by_css_selector('#sasine1_2').send_keys('215')
+            driver.find_element_by_xpath("//input[@type='PASSWORD' and @name='orderpass']").send_keys(tpassword)
+            self.log.info(f'stop price input done.')
+            driver.find_element_by_xpath("//button[@class='execute' and @type='submit']").click()
+            driver.find_element_by_xpath("//button[@class='execute' and @type='submit']").click()
+
+            # 逆指値がレートより高い or 低い場合などなにかのエラーが出た時
+            try:
+                error_msg = driver.find_element_by_xpath("//div[@class='error_str']").text
+            except NoSuchElementException as e:
+                pass
+            self.log.info(f'stop loss order done. :[{stop_price}.{stop_pips}')
+            # FXトップページにアクセス
+            driver.get('https://fx.sbisec.co.jp/forex/trade/client/index.aspx')
+            self.log.info('fx top page transition done.')
+
+            # ディーリングボードのフレームに設定
+            frame_price = driver.find_element_by_css_selector('#frame_price')
+            driver.switch_to.frame(frame_price)
+            self.log.info(f'frame switch done. :[#frame_price]')
+        except Exception as e:
+            self.log.error(f'stop loss order error. :[{e}]')
+            return [False, tmp_driver]
+
+#            # 戻るを5回やってFXトップページに遷移
+#            driver.back()
+#            driver.back()
+#            driver.back()
+#            driver.back()
+#            driver.back()
+
+
+        self.log.info('order_stop_loss() done.')
+        return [True, driver]
+
+
+
+    def cancel_order(self, driver):
+        """
+        * 注文 or 決済注文の取消を行う
+        * param
+            driver:webdriver (ディーリングボードフレームに設定された状態)
+        * return
+            array-like
+            * 成功時
+                True:bool
+                driver:webdriver (ディーリングボードフレームに設定された状態)
+            * 失敗時
+                False:bool
+                driver:webdriver (引数に渡された状態)
+        """
+        self.log.info('cancel_order() called.')
+        tmp_driver = driver
+
+        try:
+            # 注文照会(取消・訂正)へ遷移
+            driver.switch_to.default_content()
+            frame_top = driver.find_element_by_css_selector('#frame_top')
+            driver.switch_to.frame(frame_top)
+            driver.find_element_by_css_selector('#watch').click()
+            driver.find_element_by_css_selector('#orderList').click()
+            self.log.info(f'cancle page transition done.')
+
+            # トレードフレームにスイッチ
+            driver.switch_to.default_content()
+            frame_trade = driver.find_element_by_css_selector('#frame_trade')
+            driver.switch_to.frame(frame_trade)
+
+
+
+            # 注文取消実行
+            cancel_url = driver.find_element_by_xpath("//*[@id='Label1']/table/tbody/tr/td[13]/span/a[2]").click()
+            driver.find_element_by_xpath("//input[@type='PASSWORD' and @name='orderpass']").send_keys(tpassword)
+            driver.find_element_by_xpath("//button[@class='execute' and @name='kakunin' and @value='注文取消']").click()
+            self.log.info(f'cancel order done.')
+
+            # FXトップページにアクセス
+            driver.get('https://fx.sbisec.co.jp/forex/trade/client/index.aspx')
+
+            frame_price = driver.find_element_by_css_selector('#frame_price')
+            driver.switch_to.frame(frame_price)
+        except Exception as e:
+            self.log.error(f'cancel order error. :[{e}]')
+            return [False, tmp_driver]
+
+        self.log.info('cancel_order() called.')
+        return [True, driver]
+
+
+
+
+    def order_trail(self, driver, stop_price, stop_pips, trail_range='010'):
+        """
+        * トレールでの決済注文を発注
+          ポジションレートから利益が出てから使用する
+        * param
+            driver:webdriver('ディーリングボードのフレームに設定した状態')
+            stop_price:str 逆指値(円)
+            stop_pips:str  逆指値(pips)
+            trail_range:str (default '010' SBIの最低レンジ)
+        * return
+            array-like
+            *成功時
+                True:bool
+                driver:webdriver('ディーリングボードのフレームに設定した状態')
+            *失敗時
+                False:bool
+                driver:引数に渡された状態
+        """
+
+        self.log.info('order_stop_loss_trail() called.')
+        tmp_driver = driver
+
+        try:
+            # 照会をクリック
+            driver.switch_to.default_content()
+            frame_top = driver.find_element_by_css_selector('#frame_top')
+            driver.switch_to.frame(frame_top)
+            driver.find_element_by_css_selector('#watch').click()
+            self.log.info(f'syoukai link click done.')
+
+            # 決済画面に遷移
+            driver.switch_to.default_content()
+            frame_trade = driver.find_element_by_css_selector('#frame_trade')
+            driver.switch_to.frame(frame_trade)
+            url = driver.find_element_by_xpath("//*[@id='Label1']/table[2]/tbody/tr[3]/td[9]/a").get_attribute('href')
+            driver.get(url)
+            self.log.info('payment page transition done.')
+
+            # ストップロスをトレールで入力し発注
+            order_tyep_elem = driver.find_element_by_xpath("//select[@name='order']")
+            order_type_drop = Select(order_tyep_elem)
+            order_type_drop.select_by_visible_text('トレール')
+            driver.find_element_by_css_selector('#sasine1_1').send_keys(stop_price)
+            driver.find_element_by_xpath("//input[@name='sasine1_2']").send_keys(stop_pips)
+            driver.find_element_by_css_selector('#trail1_1').send_keys(0)
+            driver.find_element_by_xpath("//input[@name='trail1_2']").send_keys(trail_range)
+            driver.find_element_by_xpath("//input[@type='PASSWORD' and @name='orderpass']").send_keys(tpassword)
+            driver.find_element_by_xpath("//button[@class='execute' and @type='submit']").click()
+            driver.find_element_by_xpath("//button[@class='execute' and @type='submit']").click()
+            try:
+                error_msg = driver.find_element_by_xpath("//div[@class='error_str']").text
+            except NoSuchElementException as e:
+                pass
+
+            self.log.info('trail order done.')
+
+            # FXトップページに戻る
+            driver.get('https://fx.sbisec.co.jp/forex/trade/client/index.aspx')
+            self.log.info(f'fx top page transition done.')
+
+            # ディーリングボードのフレームに戻る
+            frame_price = driver.find_element_by_css_selector('#frame_price')
+            driver.switch_to.frame(frame_price)
+            self.log.info(f'dealing board frame set up done.')
+        except Exception as e:
+            self.log.error(f'trail set error. :[{e}]')
+            return [False, tmp_driver]
+
+
+        self.log.info('order_stop_loss_trail() done.')
+        return [True, driver]
+
+
+
+    def is_tategyoku(self, driver):
+        """
+        * 建玉があるか確認する
+        * param
+            driver:webdriver (ディーリングボードに設定されたドライバ)
+        * return
+            array-like
+            * 建玉がある場合
+                True:bool
+                driver:webdriver (ディーリングボードに設定されたドライバ)
+            * 建玉がない場合
+                False:bool
+                driver:webdriver (ディーリングボードに設定されたドライバ)
+        """
+        self.log.info(f'is_tategyoku() called.')
+        tmp_driver = driver
+        # frameを一旦戻してFXトップページにスイッチ
+        driver.switch_to.default_content()
+
+        # frame_topにスイッチ
+        frame_top = driver.find_element_by_css_selector('#frame_top')
+        driver.switch_to.frame(frame_top)
+
+        # 「照会」をクリックし建玉サマリにフレームをスイッチ
+        driver.find_element_by_css_selector('#watch').click()
+        driver.switch_to.default_content()
+        frame_trade = driver.find_element_by_css_selector('#frame_trade')
+        driver.switch_to.frame(frame_trade)
+        try:
+            driver.find_element_by_css_selector('.error_str')
+        except NoSuchElementException as e:
+            self.log.info(f'not found tategyoku.') 
+            driver = tmp_driver
+            return [True, driver]
+             
+        driver = tmp_driver
+        self.log.info(f'tategyoku exist.')
+        self.log.info(f'is_tategyoku() done.')
+        return [False, driver]
+        
 
 
     def scrap_macd_stoch_close(self, cycle_minute=1, sleep_sec=0.1, n_row=10, trv_time_lag=np.arange(5, 10), headless=True):
